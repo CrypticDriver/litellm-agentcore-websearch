@@ -1,0 +1,4 @@
+# 在现有 LiteLLM proxy config.yaml 的 litellm_settings 中追加 callbacks 一行即可，
+# 其余配置（model_list 等）保持不变。
+litellm_settings:
+  callbacks: aws_agentcore_callback.aws_agentcore_websearch_handler
