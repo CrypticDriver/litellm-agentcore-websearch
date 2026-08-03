@@ -119,9 +119,9 @@ litellm_settings:
 | `AGENTCORE_SEARCH_TOOL` | 默认 `web-search-tool___WebSearch` | target 名不同时需修改 |
 | `AGENTCORE_MAX_RESULTS` | 默认 `10` | 每次搜索返回条数 |
 
-### 2.4 IAM 权限
+### 2.4 AWS 凭证与 IAM 权限
 
-LiteLLM proxy 进程的 AWS 身份（EKS 推荐 IRSA / Pod Identity，EC2 用 instance profile，无需长期密钥）需要：
+搜索请求以 SigV4 签名调用 gateway，凭证走 **boto3 默认凭证链**（环境变量 → shared config → 容器/实例身份）。无论哪种凭证，其 IAM 身份都只需要这一条权限：
 
 ```json
 {
@@ -133,6 +133,64 @@ LiteLLM proxy 进程的 AWS 身份（EKS 推荐 IRSA / Pod Identity，EC2 用 in
   }]
 }
 ```
+
+按部署环境二选一：
+
+**A. 跑在 AWS 上（EKS / EC2）**：用托管身份，无需长期密钥。EKS 用 IRSA / Pod Identity，EC2 用 instance profile，把上述策略挂到对应角色即可，不需要配置任何凭证变量。
+
+**B. 跑在非 AWS 环境（自建 / 第三方云 K8s）**：创建一个仅有上述权限的专用 IAM 用户，用其 AKSK 以环境变量注入。
+
+> 注意：Bedrock API key（`AWS_BEARER_TOKEN_BEDROCK`）只能调 Bedrock runtime，**不能**用于 gateway 的 SigV4 签名。即使模型调用已经用 API key 跑通，搜索这条链路也需要单独一组 AKSK。
+
+```bash
+# 一次性：创建专用 IAM 用户（权限仅 InvokeGateway，泄露影响面可控）
+aws iam create-user --user-name litellm-websearch
+aws iam put-user-policy --user-name litellm-websearch \
+  --policy-name invoke-websearch-gateway \
+  --policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"bedrock-agentcore:InvokeGateway","Resource":"arn:aws:bedrock-agentcore:us-east-1:<ACCOUNT_ID>:gateway/<gatewayId>"}]}'
+aws iam create-access-key --user-name litellm-websearch   # 记下 AccessKeyId / SecretAccessKey
+```
+
+K8s 部署示例（Secret + Deployment env）：
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: agentcore-websearch
+type: Opaque
+stringData:
+  access_key_id: AKIA...
+  secret_access_key: "..."
+---
+# Deployment 的 LiteLLM 容器内追加：
+env:
+  - name: AWS_ACCESS_KEY_ID
+    valueFrom: {secretKeyRef: {name: agentcore-websearch, key: access_key_id}}
+  - name: AWS_SECRET_ACCESS_KEY
+    valueFrom: {secretKeyRef: {name: agentcore-websearch, key: secret_access_key}}
+  - name: AGENTCORE_GATEWAY_URL
+    value: https://<gatewayId>.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp
+  - name: PYTHONPATH
+    value: /app/callbacks
+```
+
+与模型调用凭证的关系：
+
+- 模型走 **Bedrock API key**（`AWS_BEARER_TOKEN_BEDROCK`）时，注入的 AKSK 可能被 Bedrock SDK 的默认凭证链抢先使用导致模型调用 403。建议在 `model_list` 里把模型钉死在 API key 上：
+
+  ```yaml
+  model_list:
+    - model_name: claude-sonnet
+      litellm_params:
+        model: bedrock/us.anthropic.claude-sonnet-4-5-20250929-v1:0
+        aws_region_name: us-east-1
+        aws_bearer_token: os.environ/AWS_BEARER_TOKEN_BEDROCK
+  ```
+
+- 模型本来就走 AKSK 时，若两组凭证不同，同理在 `model_list` 里用 `aws_access_key_id` / `aws_secret_access_key` 显式指定模型侧凭证，避免混用。
+
+运维提示：专用 AKSK 属长期密钥，建议纳入定期轮换；boto3 从环境读取凭证，轮换后滚动重启 pod 生效。
 
 ### 2.5 重启并验证
 
