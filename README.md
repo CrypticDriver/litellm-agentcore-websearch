@@ -53,16 +53,66 @@ python3 aws_agentcore_search.py "AWS 最新新闻"     # 有结果即通
 
 ## 第二步：部署到 LiteLLM proxy
 
-**1. 放文件**：两个 py 文件放进容器/主机同一目录（如 `/app/callbacks/`），Docker COPY 或 K8s ConfigMap 挂载均可。
+目标：让 proxy 容器内出现这两个 py 文件，且 `PYTHONPATH` 指向其目录、config.yaml 注册 callback。按部署方式选一种。
 
-**2. config.yaml 加一行**（其余配置不动）：
+**方式 A：K8s ConfigMap 挂载**（无需改镜像，推荐）
+
+```bash
+# 1. 两个 py 文件打成 ConfigMap
+kubectl create configmap agentcore-callback \
+  --from-file=aws_agentcore_callback.py --from-file=aws_agentcore_search.py
+```
+
+```yaml
+# 2. Deployment 里挂载到 /app/callbacks 并设环境变量
+spec:
+  template:
+    spec:
+      containers:
+        - name: litellm
+          env:
+            - name: PYTHONPATH
+              value: /app/callbacks
+            - name: AGENTCORE_GATEWAY_URL
+              value: https://<gatewayId>.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp
+          volumeMounts:
+            - name: agentcore-callback
+              mountPath: /app/callbacks
+      volumes:
+        - name: agentcore-callback
+          configMap: {name: agentcore-callback}
+```
+
+config.yaml 本身通常也是 ConfigMap（LiteLLM 官方 chart 即如此），在其 `litellm_settings` 里加一行后一起更新：
 
 ```yaml
 litellm_settings:
   callbacks: aws_agentcore_callback.aws_agentcore_websearch_handler
 ```
 
-**3. 环境变量**：
+生效：`kubectl rollout restart deployment/<litellm>`。
+
+**方式 B：自建镜像**
+
+```dockerfile
+FROM ghcr.io/berriai/litellm:main-stable
+COPY aws_agentcore_callback.py aws_agentcore_search.py /app/callbacks/
+ENV PYTHONPATH=/app/callbacks
+```
+
+config.yaml 同样加上面那一行 callbacks；`AGENTCORE_GATEWAY_URL` 等运行时再注入。
+
+**方式 C：主机直跑**（VM / systemd）
+
+```bash
+mkdir -p /opt/litellm/callbacks && cp aws_agentcore_*.py /opt/litellm/callbacks/
+# config.yaml 加 callbacks 一行，然后：
+PYTHONPATH=/opt/litellm/callbacks \
+AGENTCORE_GATEWAY_URL=https://<gatewayId>.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp \
+litellm --config config.yaml
+```
+
+**环境变量一览**：
 
 | 变量 | 说明 |
 |---|---|
@@ -72,7 +122,7 @@ litellm_settings:
 | `AGENTCORE_SEARCH_TOOL` | 工具名，默认 `web-search-tool___WebSearch` |
 | `AGENTCORE_MAX_RESULTS` | 每次搜索条数，默认 `10` |
 
-**4. AWS 凭证**（见下节）→ **5. 重启 proxy**。
+最后配好 **AWS 凭证**（见下节），重启 proxy。
 
 验证：接入该 proxy 的 Claude Code 里问一个时新问题，应返回带引用的搜索结果。proxy 以 `--detailed_debug` 启动可见 `AgentCoreWebSearch: executing search '...'` 日志。
 
