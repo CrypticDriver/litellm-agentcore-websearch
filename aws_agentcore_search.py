@@ -13,6 +13,11 @@ from botocore.awsrequest import AWSRequest
 GATEWAY_URL = os.environ["AGENTCORE_GATEWAY_URL"]  # required
 GATEWAY_REGION = os.environ.get("AGENTCORE_GATEWAY_REGION", "us-east-1")
 
+# MCP revision this client speaks. Sent on every request because the gateway is
+# called statelessly, without an initialize handshake to negotiate a version;
+# servers that predate the header ignore it.
+MCP_PROTOCOL_VERSION = "2025-06-18"
+
 _session = boto3.Session()
 
 
@@ -22,7 +27,11 @@ def _mcp_call(payload: dict) -> dict:
         method="POST",
         url=GATEWAY_URL,
         data=body,
-        headers={"Content-Type": "application/json", "Accept": "application/json, text/event-stream"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/event-stream",
+            "MCP-Protocol-Version": MCP_PROTOCOL_VERSION,
+        },
     )
     SigV4Auth(_session.get_credentials(), "bedrock-agentcore", GATEWAY_REGION).add_auth(req)
     http_req = urllib.request.Request(GATEWAY_URL, data=body, headers=dict(req.headers), method="POST")
